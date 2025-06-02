@@ -29,8 +29,9 @@ type ChatResponse = {
   error?: string;
 };
 
-// Store active sessions
+// Store active sessions and their conversation history
 const activeSessions = new Map<string, AgentLoop>();
+const sessionHistory = new Map<string, Array<ChatCompletionMessageParam>>(); // Complete conversation history
 
 // Define read-only tool functions (tools that only read, don't modify)
 const READ_ONLY_TOOLS = new Set([
@@ -188,17 +189,27 @@ async function handleChatRequest(
   // HTTP mode is always read-only - force SUGGEST mode regardless of request
   const approvalPolicy: ApprovalPolicy = AutoApprovalMode.SUGGEST;
 
-  const messages: Array<ChatCompletionMessageParam> = [];
+  // Get or initialize conversation history for this session
+  const prevItems = [...(sessionHistory.get(sessionId) || [])]; // Create a copy to avoid reference issues
+  const messageCollector = { messages: [] as Array<ChatCompletionMessageParam> }; // Object wrapper to avoid any reference issues
   let hasError = false;
   let errorMessage = "";
 
+  console.log(`[${sessionId}] Request - prevItems.length: ${prevItems.length}, messageCollector.messages.length: ${messageCollector.messages.length}, prompt: "${chatRequest.prompt.substring(0, 50)}..."`);
+
   try {
-    // Create or reuse agent for this session
+    // Always create a fresh agent for each request to avoid state pollution
+    // The existing agent might have stale onItem callbacks or other state issues
     let agent = activeSessions.get(sessionId);
+    console.log(`[${sessionId}] Agent exists: ${!!agent}`);
     
-    if (!agent) {
-      // Add read-only instructions to the existing instructions
-      const readOnlyInstructions = `${config.instructions || ""}
+    // Terminate existing agent if it exists
+    if (agent) {
+      agent.terminate();
+    }
+    
+    // Always create a fresh agent
+    const readOnlyInstructions = `${config.instructions || ""}
 
 IMPORTANT: You are running in READ-ONLY HTTP mode. You can only:
 - Read files (Read, Glob, Grep, LS, NotebookRead)
@@ -214,16 +225,21 @@ You CANNOT:
 
 If the user asks you to modify files or run commands, politely explain that you're in read-only mode and offer to help with code analysis instead.`;
 
-      agent = new AgentLoop({
+    agent = new AgentLoop({
         model: config.model,
         config: config,
         instructions: readOnlyInstructions,
         approvalPolicy,
         onItem: (item: ChatCompletionMessageParam) => {
-          // Filter and modify messages for read-only mode
+          console.log(`[${sessionId}] onItem called - role: ${item.role}, messageCollector.messages.length before: ${messageCollector.messages.length}`);
+          
+          // Filter for HTTP response
           const filteredItem = filterMessageForReadOnly(item);
           if (filteredItem) {
-            messages.push(filteredItem);
+            messageCollector.messages.push(filteredItem);
+            console.log(`[${sessionId}] Added filtered item to messageCollector - total: ${messageCollector.messages.length}, item role: ${filteredItem.role}`);
+          } else {
+            console.log(`[${sessionId}] Item filtered out - role: ${item.role}`);
           }
         },
         onLoading: () => {
@@ -241,14 +257,21 @@ If the user asks you to modify files or run commands, politely explain that you'
       });
       
       activeSessions.set(sessionId, agent);
-    }
 
     const inputItem = await createInputItem(
       chatRequest.prompt,
       chatRequest.imagePaths || []
     );
     
-    await agent.run([inputItem]);
+    // Call agent.run with new input and previous conversation history
+    console.log(`[${sessionId}] Calling agent.run - input.length: 1, prevItems.length: ${prevItems.length}`);
+    await agent.run([inputItem], prevItems);
+    console.log(`[${sessionId}] agent.run completed - messageCollector.messages.length: ${messageCollector.messages.length}`);
+    
+    // Update session history with all messages from this conversation
+    const allMessages = [...prevItems, ...messageCollector.messages];
+    sessionHistory.set(sessionId, allMessages);
+    console.log(`[${sessionId}] Updated session history - total items: ${allMessages.length}`);
 
   } catch (error) {
     hasError = true;
@@ -257,13 +280,15 @@ If the user asks you to modify files or run commands, politely explain that you'
     console.error("Agent error:", error);
   }
 
+  console.log(`[${sessionId}] Before response creation - messageCollector.messages.length: ${messageCollector.messages.length}`);
   const response: ChatResponse = {
     sessionId,
-    messages,
+    messages: messageCollector.messages,
     status: hasError ? "error" : "completed",
     ...(hasError && { error: errorMessage }),
   };
 
+  console.log(`[${sessionId}] Response created - response.messages.length: ${response.messages.length}`);
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify(response, null, 2));
 }
@@ -277,6 +302,7 @@ async function handleSessionTerminate(
   if (agent) {
     agent.terminate();
     activeSessions.delete(sessionId);
+    sessionHistory.delete(sessionId);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ message: "Session terminated" }));
   } else {
