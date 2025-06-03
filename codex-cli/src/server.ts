@@ -9,6 +9,28 @@ import { AutoApprovalMode } from "./utils/auto-approval-mode.js";
 import { createInputItem } from "./utils/input-utils.js";
 import { randomUUID } from "node:crypto";
 
+// Error types for better error handling
+class ValidationError extends Error {
+  constructor(message: string, public field?: string) {
+    super(message);
+    this.name = "ValidationError";
+  }
+}
+
+class SessionError extends Error {
+  constructor(message: string, public sessionId?: string) {
+    super(message);
+    this.name = "SessionError";
+  }
+}
+
+class AgentError extends Error {
+  constructor(message: string, public originalError?: Error) {
+    super(message);
+    this.name = "AgentError";
+  }
+}
+
 type ServerConfig = {
   port: number;
   host: string;
@@ -106,6 +128,91 @@ function filterMessageForReadOnly(item: ChatCompletionMessageParam): ChatComplet
   return item;
 }
 
+// Validation functions
+function validateChatRequest(body: any): ChatRequest {
+  if (!body || typeof body !== 'object') {
+    throw new ValidationError("Request body must be a JSON object");
+  }
+
+  if (!body.prompt || typeof body.prompt !== 'string') {
+    throw new ValidationError("'prompt' field is required and must be a string", "prompt");
+  }
+
+  if (body.prompt.trim().length === 0) {
+    throw new ValidationError("'prompt' cannot be empty", "prompt");
+  }
+
+  if (body.prompt.length > 10000) {
+    throw new ValidationError("'prompt' is too long (max 10000 characters)", "prompt");
+  }
+
+  if (body.sessionId && typeof body.sessionId !== 'string') {
+    throw new ValidationError("'sessionId' must be a string", "sessionId");
+  }
+
+  if (body.sessionId && body.sessionId.length > 100) {
+    throw new ValidationError("'sessionId' is too long (max 100 characters)", "sessionId");
+  }
+
+  if (body.imagePaths && !Array.isArray(body.imagePaths)) {
+    throw new ValidationError("'imagePaths' must be an array", "imagePaths");
+  }
+
+  if (body.imagePaths && body.imagePaths.length > 10) {
+    throw new ValidationError("Too many images (max 10)", "imagePaths");
+  }
+
+  return {
+    prompt: body.prompt.trim(),
+    sessionId: body.sessionId,
+    imagePaths: body.imagePaths,
+    approvalMode: body.approvalMode
+  };
+}
+
+// Error response utilities
+function sendErrorResponse(
+  res: NodeJS.WritableStream & { writeHead: (code: number, headers?: Record<string, string>) => void; end: (data?: string) => void },
+  statusCode: number,
+  error: string,
+  details?: any
+) {
+  const response = {
+    error,
+    timestamp: new Date().toISOString(),
+    ...(details && { details })
+  };
+
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(response, null, 2));
+}
+
+function handleError(
+  res: NodeJS.WritableStream & { writeHead: (code: number, headers?: Record<string, string>) => void; end: (data?: string) => void },
+  error: Error,
+  context?: string
+) {
+  console.error(`❌ ${context || 'Error'}:`, {
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
+    timestamp: new Date().toISOString()
+  });
+
+  if (error instanceof ValidationError) {
+    sendErrorResponse(res, 400, error.message, { field: error.field });
+  } else if (error instanceof SessionError) {
+    sendErrorResponse(res, 404, error.message, { sessionId: error.sessionId });
+  } else if (error instanceof AgentError) {
+    sendErrorResponse(res, 503, "Service temporarily unavailable", { 
+      message: "Agent processing failed", 
+      retry: true 
+    });
+  } else {
+    sendErrorResponse(res, 500, "Internal server error");
+  }
+}
+
 export async function runServer({ port, host, config }: ServerConfig): Promise<void> {
   // Use Node.js built-in HTTP server to avoid external dependencies
   const { createServer } = await import("node:http");
@@ -114,7 +221,7 @@ export async function runServer({ port, host, config }: ServerConfig): Promise<v
   const server = createServer(async (req, res) => {
     // Enable CORS
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     
     if (req.method === "OPTIONS") {
@@ -130,44 +237,89 @@ export async function runServer({ port, host, config }: ServerConfig): Promise<v
         await handleChatRequest(req, res, config);
       } else if (req.method === "GET" && url.pathname === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok", version: "0.1.31" }));
+        res.end(JSON.stringify({ 
+          status: "ok", 
+          version: "0.1.31",
+          timestamp: new Date().toISOString(),
+          activeSessions: activeSessions.size
+        }));
       } else if (req.method === "DELETE" && url.pathname?.startsWith("/sessions/")) {
         const sessionId = url.pathname.split("/")[2];
-        if (sessionId) {
-          await handleSessionTerminate(res, sessionId);
-        } else {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Session ID required" }));
+        if (!sessionId || sessionId.trim().length === 0) {
+          throw new ValidationError("Session ID is required", "sessionId");
         }
+        await handleSessionTerminate(res, sessionId.trim());
+      } else if (req.method === "GET" && url.pathname === "/sessions") {
+        // List active sessions endpoint
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          activeSessions: Array.from(activeSessions.keys()),
+          count: activeSessions.size,
+          timestamp: new Date().toISOString()
+        }));
       } else {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Not found" }));
+        sendErrorResponse(res, 404, "Endpoint not found", {
+          method: req.method,
+          path: url.pathname,
+          availableEndpoints: [
+            "POST /chat",
+            "GET /health", 
+            "GET /sessions",
+            "DELETE /sessions/{sessionId}"
+          ]
+        });
       }
     } catch (error) {
-      // eslint-disable-next-line no-console
-      console.error("Server error:", error);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Internal server error" }));
+      handleError(res, error as Error, "Server request");
     }
   });
 
+  // Add request timeouts
+  server.timeout = 300000; // 5 minutes
+  server.headersTimeout = 60000; // 1 minute
+  server.requestTimeout = 300000; // 5 minutes
+
   // Return a promise that resolves when server starts
   return new Promise<void>((resolve, reject) => {
-    server.on('error', (error) => {
-      console.error("❌ Server error:", error);
-      reject(error);
+    server.on('error', (error: any) => {
+      if (error.code === 'EADDRINUSE') {
+        console.error(`❌ Port ${port} is already in use. Please try a different port.`);
+        reject(new Error(`Port ${port} is already in use`));
+      } else if (error.code === 'EACCES') {
+        console.error(`❌ Permission denied to bind to port ${port}. Try using a port above 1024.`);
+        reject(new Error(`Permission denied for port ${port}`));
+      } else {
+        console.error("❌ Server error:", error);
+        reject(error);
+      }
     });
-    
+
     server.listen(port, host, () => {
-      // eslint-disable-next-line no-console
-      console.log(`🚀 Codex HTTP server running at http://${host}:${port} (READ-ONLY MODE)`);
-      // eslint-disable-next-line no-console
-      console.log(`📋 Health check: http://${host}:${port}/health`);
-      // eslint-disable-next-line no-console
-      console.log(`💬 Chat endpoint: POST http://${host}:${port}/chat`);
-      // eslint-disable-next-line no-console
+      console.log(`🚀 Codex HTTP server running at http://${host}:${port}`);
       console.log(`🔒 Note: HTTP mode only allows read operations (file analysis, code exploration)`);
+      console.log(`📚 Available endpoints:`);
+      console.log(`   POST /chat - Chat with Julia`);
+      console.log(`   GET  /health - Health check`);
+      console.log(`   GET  /sessions - List active sessions`);
+      console.log(`   DELETE /sessions/{id} - Terminate session`);
       resolve();
+    });
+
+    // Handle graceful shutdown
+    process.on('SIGINT', () => {
+      console.log('\n🛑 Received SIGINT, shutting down gracefully...');
+      server.close(() => {
+        console.log('✅ Server closed');
+        process.exit(0);
+      });
+    });
+
+    process.on('SIGTERM', () => {
+      console.log('\n🛑 Received SIGTERM, shutting down gracefully...');
+      server.close(() => {
+        console.log('✅ Server closed');
+        process.exit(0);
+      });
     });
   });
 }
@@ -177,25 +329,57 @@ async function handleChatRequest(
   res: NodeJS.WritableStream & { writeHead: (code: number, headers?: Record<string, string>) => void; end: (data?: string) => void },
   config: AppConfig
 ): Promise<void> {
-  let body = "";
-  
-  for await (const chunk of req) {
-    body += chunk.toString();
-  }
-
-  const chatRequest: ChatRequest = JSON.parse(body);
-  const sessionId = chatRequest.sessionId || randomUUID();
-  
-  // HTTP mode is always read-only - force SUGGEST mode regardless of request
-  const approvalPolicy: ApprovalPolicy = AutoApprovalMode.SUGGEST;
-
-  // Get or initialize conversation history for this session
-  const prevItems = [...(sessionHistory.get(sessionId) || [])]; // Create a copy to avoid reference issues
-  const messageCollector = { messages: [] as Array<ChatCompletionMessageParam> }; // Object wrapper to avoid any reference issues
-  let hasError = false;
-  let errorMessage = "";
-
   try {
+    // Read and validate request body
+    let body = "";
+    let chunkCount = 0;
+    const maxChunks = 1000; // Prevent DoS attacks
+    
+    for await (const chunk of req) {
+      chunkCount++;
+      if (chunkCount > maxChunks) {
+        throw new ValidationError("Request body too large");
+      }
+      body += chunk.toString();
+    }
+
+    if (body.length === 0) {
+      throw new ValidationError("Request body is empty");
+    }
+
+    if (body.length > 50000) {
+      throw new ValidationError("Request body too large (max 50KB)");
+    }
+
+    // Parse and validate JSON
+    let parsedBody: any;
+    try {
+      parsedBody = JSON.parse(body);
+    } catch (parseError) {
+      throw new ValidationError("Invalid JSON in request body");
+    }
+
+    // Validate chat request
+    const chatRequest = validateChatRequest(parsedBody);
+    const sessionId = chatRequest.sessionId || randomUUID();
+    
+    // Validate session ID format if provided
+    if (chatRequest.sessionId && !/^[a-zA-Z0-9_-]+$/.test(chatRequest.sessionId)) {
+      throw new ValidationError("Session ID contains invalid characters", "sessionId");
+    }
+    
+    // HTTP mode is always read-only - force SUGGEST mode regardless of request
+    const approvalPolicy: ApprovalPolicy = AutoApprovalMode.SUGGEST;
+
+    // Get or initialize conversation history for this session
+    const prevItems = [...(sessionHistory.get(sessionId) || [])];
+    const messageCollector = { messages: [] as Array<ChatCompletionMessageParam> };
+
+    // Check for too many messages in session history
+    if (prevItems.length > 1000) {
+      throw new SessionError("Session has too many messages (max 1000)", sessionId);
+    }
+
     // Always create a fresh agent for each request to avoid state pollution
     // The existing agent might have stale onItem callbacks or other state issues
     let agent = activeSessions.get(sessionId);
@@ -256,43 +440,59 @@ If the user asks you to modify files or run commands, politely explain that you'
     );
     
     // Call agent.run with new input and previous conversation history
-    await agent.run([inputItem], prevItems);
+    try {
+      await agent.run([inputItem], prevItems);
+    } catch (agentError) {
+      throw new AgentError("Failed to process chat request", agentError as Error);
+    }
     
     // Update session history with all messages from this conversation
     const allMessages = [...prevItems, ...messageCollector.messages];
     sessionHistory.set(sessionId, allMessages);
 
-  } catch (error) {
-    hasError = true;
-    errorMessage = error instanceof Error ? error.message : "Unknown error";
-    // eslint-disable-next-line no-console
-    console.error("Agent error:", error);
-  }
+    // Send successful response
+    const response: ChatResponse = {
+      sessionId,
+      messages: messageCollector.messages,
+      status: "completed",
+    };
+    
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(response, null, 2));
 
-  const response: ChatResponse = {
-    sessionId,
-    messages: messageCollector.messages,
-    status: hasError ? "error" : "completed",
-    ...(hasError && { error: errorMessage }),
-  };
-  res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify(response, null, 2));
+  } catch (error) {
+    handleError(res, error as Error, "Chat request");
+  }
 }
 
 async function handleSessionTerminate(
   res: NodeJS.WritableStream & { writeHead: (code: number, headers?: Record<string, string>) => void; end: (data?: string) => void }, 
   sessionId: string
 ): Promise<void> {
-  const agent = activeSessions.get(sessionId);
-  
-  if (agent) {
-    agent.terminate();
-    activeSessions.delete(sessionId);
-    sessionHistory.delete(sessionId);
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ message: "Session terminated" }));
-  } else {
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Session not found" }));
+  try {
+    const agent = activeSessions.get(sessionId);
+    
+    if (agent) {
+      try {
+        agent.terminate();
+      } catch (terminateError) {
+        console.error(`⚠️ Error terminating agent for session ${sessionId}:`, terminateError);
+        // Continue with cleanup even if termination fails
+      }
+      
+      activeSessions.delete(sessionId);
+      sessionHistory.delete(sessionId);
+      
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ 
+        message: "Session terminated successfully",
+        sessionId,
+        timestamp: new Date().toISOString()
+      }));
+    } else {
+      throw new SessionError("Session not found", sessionId);
+    }
+  } catch (error) {
+    handleError(res, error as Error, "Session termination");
   }
 }
