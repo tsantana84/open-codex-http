@@ -1,0 +1,371 @@
+openapi: 3.0.3
+info:
+  title: Codex HTTP API
+  description: |
+    HTTP API for the Codex CLI tool that provides read-only access to Julia AI assistant.
+    This API allows you to chat with Julia to analyze code, explore codebases, and get 
+    explanations without modifying files or executing commands.
+  version: 0.1.31
+  contact:
+    name: Codex CLI
+    url: https://github.com/anthropics/claude-code
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+
+paths:
+  /chat:
+    post:
+      summary: Chat with Julia AI assistant
+      description: |
+        Send a message to Julia for code analysis, exploration, and questions.
+        Julia operates in read-only mode and can only read files, not modify them.
+      operationId: chat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+            examples:
+              simple_question:
+                summary: Simple code question
+                value:
+                  prompt: "What does the server.ts file do?"
+              with_session:
+                summary: Continue conversation
+                value:
+                  prompt: "Can you explain the handleChatRequest function?"
+                  sessionId: "my-session-123"
+              with_images:
+                summary: Analyze screenshots
+                value:
+                  prompt: "Analyze this screenshot"
+                  imagePaths: ["/path/to/screenshot.png"]
+      responses:
+        '200':
+          description: Successful chat response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+              examples:
+                success:
+                  summary: Successful response
+                  value:
+                    sessionId: "abc123-def456-ghi789"
+                    status: "completed"
+                    messages:
+                      - role: "user"
+                        content: "What does the server.ts file do?"
+                      - role: "assistant"
+                        content: "The server.ts file implements an HTTP server that provides a read-only interface to Julia AI assistant..."
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missing_prompt:
+                  summary: Missing prompt field
+                  value:
+                    error: "'prompt' field is required and must be a string"
+                    field: "prompt"
+                    timestamp: "2025-03-06T10:30:00Z"
+                empty_prompt:
+                  summary: Empty prompt
+                  value:
+                    error: "'prompt' cannot be empty"
+                    field: "prompt"
+                    timestamp: "2025-03-06T10:30:00Z"
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Service temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /health:
+    get:
+      summary: Health check
+      description: Check if the server is running and get basic status information
+      operationId: health
+      responses:
+        '200':
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: "ok"
+                version: "0.1.31"
+                timestamp: "2025-03-06T10:30:00Z"
+                activeSessions: 3
+
+  /sessions:
+    get:
+      summary: List active sessions
+      description: Get a list of all currently active chat sessions
+      operationId: listSessions
+      responses:
+        '200':
+          description: List of active sessions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionsResponse'
+              example:
+                activeSessions: ["session-1", "session-2", "session-3"]
+                count: 3
+                timestamp: "2025-03-06T10:30:00Z"
+
+  /sessions/{sessionId}:
+    delete:
+      summary: Terminate session
+      description: Terminate a specific chat session and clean up its resources
+      operationId: terminateSession
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          description: The ID of the session to terminate
+          schema:
+            type: string
+            pattern: '^[a-zA-Z0-9_-]+$'
+            maxLength: 100
+          example: "session-abc123"
+      responses:
+        '200':
+          description: Session terminated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionTerminateResponse'
+              example:
+                message: "Session terminated successfully"
+                sessionId: "session-abc123"
+                timestamp: "2025-03-06T10:30:00Z"
+        '400':
+          description: Invalid session ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    ChatRequest:
+      type: object
+      required:
+        - prompt
+      properties:
+        prompt:
+          type: string
+          description: The message to send to Julia
+          minLength: 1
+          maxLength: 10000
+          example: "What does the server.ts file do?"
+        sessionId:
+          type: string
+          description: Optional session ID to continue a conversation
+          pattern: '^[a-zA-Z0-9_-]+$'
+          maxLength: 100
+          example: "my-session-123"
+        imagePaths:
+          type: array
+          description: Optional array of image file paths to analyze
+          maxItems: 10
+          items:
+            type: string
+            format: path
+          example: ["/path/to/screenshot.png", "/path/to/diagram.jpg"]
+        approvalMode:
+          type: string
+          description: |
+            Approval mode for operations (Note: HTTP mode forces read-only regardless)
+          enum: ["suggest", "auto-edit", "full-auto"]
+          default: "suggest"
+          example: "suggest"
+
+    ChatResponse:
+      type: object
+      required:
+        - sessionId
+        - messages
+        - status
+      properties:
+        sessionId:
+          type: string
+          description: The session ID for this conversation
+          example: "abc123-def456-ghi789"
+        messages:
+          type: array
+          description: Array of chat messages in the conversation
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        status:
+          type: string
+          enum: ["completed", "error"]
+          description: Status of the chat request
+          example: "completed"
+        error:
+          type: string
+          description: Error message if status is "error"
+          example: "Failed to process request"
+
+    ChatMessage:
+      type: object
+      description: A single chat message
+      required:
+        - role
+        - content
+      properties:
+        role:
+          type: string
+          enum: ["user", "assistant", "system", "tool"]
+          description: The role of the message sender
+        content:
+          type: string
+          description: The content of the message
+        tool_calls:
+          type: array
+          description: Tool calls made by the assistant (filtered for read-only operations)
+          items:
+            type: object
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - version
+        - timestamp
+        - activeSessions
+      properties:
+        status:
+          type: string
+          enum: ["ok"]
+          description: Health status
+          example: "ok"
+        version:
+          type: string
+          description: Current version of the API
+          example: "0.1.31"
+        timestamp:
+          type: string
+          format: date-time
+          description: Current server timestamp
+          example: "2025-03-06T10:30:00Z"
+        activeSessions:
+          type: integer
+          minimum: 0
+          description: Number of currently active sessions
+          example: 3
+
+    SessionsResponse:
+      type: object
+      required:
+        - activeSessions
+        - count
+        - timestamp
+      properties:
+        activeSessions:
+          type: array
+          description: List of active session IDs
+          items:
+            type: string
+          example: ["session-1", "session-2", "session-3"]
+        count:
+          type: integer
+          minimum: 0
+          description: Total number of active sessions
+          example: 3
+        timestamp:
+          type: string
+          format: date-time
+          description: Current server timestamp
+          example: "2025-03-06T10:30:00Z"
+
+    SessionTerminateResponse:
+      type: object
+      required:
+        - message
+        - sessionId
+        - timestamp
+      properties:
+        message:
+          type: string
+          description: Confirmation message
+          example: "Session terminated successfully"
+        sessionId:
+          type: string
+          description: The ID of the terminated session
+          example: "session-abc123"
+        timestamp:
+          type: string
+          format: date-time
+          description: Termination timestamp
+          example: "2025-03-06T10:30:00Z"
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - timestamp
+      properties:
+        error:
+          type: string
+          description: Error message
+          example: "Validation failed"
+        timestamp:
+          type: string
+          format: date-time
+          description: Error timestamp
+          example: "2025-03-06T10:30:00Z"
+        field:
+          type: string
+          description: Field that caused the validation error (for 400 errors)
+          example: "prompt"
+        sessionId:
+          type: string
+          description: Session ID that caused the error (for session-related errors)
+          example: "invalid-session"
+        details:
+          type: object
+          description: Additional error details
+          additionalProperties: true
+
+tags:
+  - name: chat
+    description: Chat operations with Julia AI assistant
+  - name: health
+    description: Health and status endpoints
+  - name: sessions
+    description: Session management operations
+
+externalDocs:
+  description: Codex CLI Documentation
+  url: https://docs.anthropic.com/en/docs/claude-code
