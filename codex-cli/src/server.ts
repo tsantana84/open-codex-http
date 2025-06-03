@@ -195,13 +195,10 @@ async function handleChatRequest(
   let hasError = false;
   let errorMessage = "";
 
-  console.log(`[${sessionId}] Request - prevItems.length: ${prevItems.length}, messageCollector.messages.length: ${messageCollector.messages.length}, prompt: "${chatRequest.prompt.substring(0, 50)}..."`);
-
   try {
     // Always create a fresh agent for each request to avoid state pollution
     // The existing agent might have stale onItem callbacks or other state issues
     let agent = activeSessions.get(sessionId);
-    console.log(`[${sessionId}] Agent exists: ${!!agent}`);
     
     // Terminate existing agent if it exists
     if (agent) {
@@ -231,15 +228,10 @@ If the user asks you to modify files or run commands, politely explain that you'
         instructions: readOnlyInstructions,
         approvalPolicy,
         onItem: (item: ChatCompletionMessageParam) => {
-          console.log(`[${sessionId}] onItem called - role: ${item.role}, messageCollector.messages.length before: ${messageCollector.messages.length}`);
-          
           // Filter for HTTP response
           const filteredItem = filterMessageForReadOnly(item);
           if (filteredItem) {
             messageCollector.messages.push(filteredItem);
-            console.log(`[${sessionId}] Added filtered item to messageCollector - total: ${messageCollector.messages.length}, item role: ${filteredItem.role}`);
-          } else {
-            console.log(`[${sessionId}] Item filtered out - role: ${item.role}`);
           }
         },
         onLoading: () => {
@@ -264,14 +256,11 @@ If the user asks you to modify files or run commands, politely explain that you'
     );
     
     // Call agent.run with new input and previous conversation history
-    console.log(`[${sessionId}] Calling agent.run - input.length: 1, prevItems.length: ${prevItems.length}`);
     await agent.run([inputItem], prevItems);
-    console.log(`[${sessionId}] agent.run completed - messageCollector.messages.length: ${messageCollector.messages.length}`);
     
     // Update session history with all messages from this conversation
     const allMessages = [...prevItems, ...messageCollector.messages];
     sessionHistory.set(sessionId, allMessages);
-    console.log(`[${sessionId}] Updated session history - total items: ${allMessages.length}`);
 
   } catch (error) {
     hasError = true;
@@ -280,15 +269,12 @@ If the user asks you to modify files or run commands, politely explain that you'
     console.error("Agent error:", error);
   }
 
-  console.log(`[${sessionId}] Before response creation - messageCollector.messages.length: ${messageCollector.messages.length}`);
   const response: ChatResponse = {
     sessionId,
     messages: messageCollector.messages,
     status: hasError ? "error" : "completed",
     ...(hasError && { error: errorMessage }),
   };
-
-  console.log(`[${sessionId}] Response created - response.messages.length: ${response.messages.length}`);
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify(response, null, 2));
 }
